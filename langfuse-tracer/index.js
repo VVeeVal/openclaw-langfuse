@@ -1,36 +1,46 @@
+import fs from 'fs';
+import path from 'path';
+
 /**
  * langfuse-tracer — OpenClaw plugin
  *
  * Sends an agent trace + LLM generation to Langfuse after every agent turn.
  * Uses the Langfuse REST API directly (no npm packages required).
- *
- * Required env vars in the openclaw-gateway container:
- *   LANGFUSE_PUBLIC_KEY   — project public key  (same as LANGFUSE_INIT_PROJECT_PUBLIC_KEY)
- *   LANGFUSE_SECRET_KEY   — project secret key  (same as LANGFUSE_INIT_PROJECT_SECRET_KEY)
- *   LANGFUSE_BASE_URL     — e.g. http://172.21.0.1:3050 (Docker host gateway to Langfuse)
  */
 
 export function register(api) {
-  const publicKey = process.env.LANGFUSE_PUBLIC_KEY?.trim();
-  const secretKey = process.env.LANGFUSE_SECRET_KEY?.trim();
-  const baseUrl = (process.env.LANGFUSE_BASE_URL?.trim() ?? 'http://172.21.0.1:3050').replace(/\/$/, '');
+  const fileConfig = loadLocalConfig();
+  const publicKey = (
+    process.env.LANGFUSE_PUBLIC_KEY ??
+    fileConfig.publicKey ??
+    ''
+  ).trim();
+  const secretKey = (
+    process.env.LANGFUSE_SECRET_KEY ??
+    fileConfig.secretKey ??
+    ''
+  ).trim();
+  const baseUrl = (
+    process.env.LANGFUSE_BASE_URL ??
+    fileConfig.baseUrl ??
+    'https://cloud.langfuse.com'
+  ).trim().replace(/\/$/, '');
 
   if (!publicKey || !secretKey) {
-    api.logger.info('[langfuse-tracer] LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set — tracing disabled');
+    api.logger.info('[langfuse-tracer] LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set - tracing disabled');
     return;
   }
 
   const authHeader = 'Basic ' + Buffer.from(`${publicKey}:${secretKey}`).toString('base64');
-  api.logger.info(`[langfuse-tracer] Langfuse tracing enabled → ${baseUrl}`);
+  api.logger.info(`[langfuse-tracer] Langfuse tracing enabled -> ${baseUrl}`);
 
-  // Capture the prompt text before the turn starts so we have a clean "input"
   const pendingPrompts = new Map();
 
   api.on('before_agent_start', (event, ctx) => {
     const key = ctx.sessionKey ?? ctx.agentId ?? 'default';
     pendingPrompts.set(key, {
       prompt: event.prompt ?? '',
-      startedAt: Date.now(),
+      startedAt: Date.now()
     });
   });
 
@@ -46,100 +56,205 @@ export function register(api) {
     const startedAt = pending?.startedAt ?? (durationMs ? Date.now() - durationMs : Date.now());
     const startTime = new Date(startedAt).toISOString();
 
-    // --- Extract input: prefer captured prompt, fall back to last user message ---
     let input = pending?.prompt ?? '';
     if (!input) {
-      for (let i = messages.length - 1; i >= 0; i--) {
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
         const msg = messages[i];
         if (msg?.role === 'user') {
-          input = extractText(msg.content, 2000);
+          input = extractText(msg.content, 4000);
           break;
         }
       }
     }
 
-    // --- Extract output: last assistant message text ---
-    let output = '';
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg?.role === 'assistant') {
-        output = extractText(msg.content, 4000);
-        break;
-      }
-    }
-
-    // --- Extract token usage from last assistant message with usage field ---
-    let usage;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg?.role === 'assistant' && msg.usage) {
-        const u = msg.usage;
-        usage = {
-          input: typeof u.input_tokens === 'number' ? u.input_tokens : undefined,
-          output: typeof u.output_tokens === 'number' ? u.output_tokens : undefined,
-          unit: 'TOKENS',
-        };
-        break;
-      }
-    }
-
     const traceId = randomId();
-    const generationId = randomId();
-    const batchItemId1 = randomId();
-    const batchItemId2 = randomId();
+    const rootSpanId = randomId();
+    const batch = [];
+    const toolCalls = new Map();
+    let toolCount = 0;
+    let finalAssistant = null;
 
-    const batch = [
-      {
-        id: batchItemId1,
-        type: 'trace-create',
-        timestamp: now,
-        body: {
-          id: traceId,
-          name: 'openclaw-turn',
-          sessionId: sessionKey ?? undefined,
-          userId: agentId ?? 'unknown',
-          tags: ['openclaw', agentId ?? 'unknown'],
-          input: input.slice(0, 2000) || undefined,
-          output: output.slice(0, 4000) || undefined,
-          metadata: {
-            success,
-            error: error ?? undefined,
-            messageCount: messages.length,
-          },
-          timestamp: startTime,
+    batch.push({
+      id: randomId(),
+      type: 'trace-create',
+      timestamp: startTime,
+      body: {
+        id: traceId,
+        name: 'openclaw.turn',
+        sessionId: sessionKey ?? undefined,
+        userId: agentId ?? 'unknown',
+        tags: ['openclaw', agentId ?? 'unknown'],
+        input: input || undefined,
+        metadata: {
+          success,
+          error: error ?? undefined,
+          messageCount: Array.isArray(messages) ? messages.length : 0
         },
-      },
-      {
-        id: batchItemId2,
+        timestamp: startTime
+      }
+    });
+
+    batch.push({
+      id: randomId(),
+      type: 'span-create',
+      timestamp: startTime,
+      body: {
+        id: rootSpanId,
+        traceId,
+        name: 'openclaw.turn',
+        startTime,
+        metadata: {
+          sessionKey: sessionKey ?? undefined,
+          source: 'langfuse-tracer'
+        }
+      }
+    });
+
+    for (const msg of Array.isArray(messages) ? messages : []) {
+      if (!msg || typeof msg !== 'object') continue;
+
+      if (msg.role === 'assistant') {
+        for (const part of Array.isArray(msg.content) ? msg.content : []) {
+          if (part?.type !== 'toolCall') continue;
+          const toolCallId = String(part.id ?? randomId());
+          toolCalls.set(toolCallId, {
+            name: part.name || 'tool',
+            args: toolCallArgs(part),
+            startedAt: toIsoString(msg.timestamp, startTime)
+          });
+        }
+        const assistantText = extractText(msg.content, 8000);
+        if (assistantText) finalAssistant = msg;
+      }
+
+      if (msg.role === 'toolResult') {
+        const toolCallId = typeof msg.toolCallId === 'string' ? msg.toolCallId : '';
+        const known = toolCalls.get(toolCallId) || {};
+        const toolName = msg.toolName || known.name || 'tool';
+        const outputText = extractText(msg.content, 4000) || extractAggregatedText(msg.details, 3000);
+        const toolTimestamp = toIsoString(msg.timestamp, now);
+        batch.push({
+          id: randomId(),
+          type: 'span-create',
+          timestamp: toolTimestamp,
+          body: {
+            id: randomId(),
+            traceId,
+            parentObservationId: rootSpanId,
+            name: `tool.${toolName}`,
+            startTime: known.startedAt || toolTimestamp,
+            endTime: toolTimestamp,
+            level: msg.isError ? 'ERROR' : 'DEFAULT',
+            statusMessage: msg.isError ? 'tool failed' : 'ok',
+            input: known.args,
+            output: outputText || undefined,
+            metadata: {
+              toolName,
+              toolCallId: toolCallId || undefined,
+              isError: Boolean(msg.isError),
+              durationMs: msg.details?.durationMs,
+              exitCode: msg.details?.exitCode,
+              cwd: msg.details?.cwd
+            }
+          }
+        });
+        toolCount += 1;
+      }
+    }
+
+    let usage;
+    let model;
+    if (finalAssistant?.usage) {
+      const u = finalAssistant.usage;
+      usage = {
+        input: typeof u.input === 'number' ? u.input : undefined,
+        output: typeof u.output === 'number' ? u.output : undefined,
+        total: typeof u.totalTokens === 'number' ? u.totalTokens : undefined,
+        unit: 'TOKENS'
+      };
+    }
+    if (typeof finalAssistant?.model === 'string') model = finalAssistant.model;
+
+    if (finalAssistant) {
+      const generationId = randomId();
+      const generationEnd = toIsoString(finalAssistant.timestamp, now);
+      const generationOutput = extractText(finalAssistant.content, 8000);
+
+      batch.push({
+        id: randomId(),
         type: 'generation-create',
-        timestamp: now,
+        timestamp: generationEnd,
         body: {
           id: generationId,
           traceId,
-          name: 'llm',
+          parentObservationId: rootSpanId,
+          name: 'assistant.generation',
+          model: model ?? undefined,
           startTime,
-          endTime: now,
-          input: input.slice(0, 2000) || undefined,
-          output: output.slice(0, 4000) || undefined,
+          endTime: generationEnd,
+          input: input || undefined,
+          output: generationOutput || undefined,
           level: success ? 'DEFAULT' : 'ERROR',
           statusMessage: error ?? undefined,
           usage,
           metadata: {
             durationMs,
-            messageCount: messages.length,
+            messageCount: Array.isArray(messages) ? messages.length : 0,
+            sessionKey: sessionKey ?? undefined,
+            provider: finalAssistant.provider ?? undefined,
+            assistantMessageId: finalAssistant.id ?? undefined,
+            toolCount
           },
-        },
-      },
-    ];
+          ...(finalAssistant.usage?.cost?.total != null
+            ? { costDetails: { total: Number(finalAssistant.usage.cost.total) } }
+            : {})
+        }
+      });
+
+      batch.push({
+        id: randomId(),
+        type: 'span-update',
+        timestamp: generationEnd,
+        body: {
+          id: rootSpanId,
+          traceId,
+          endTime: generationEnd,
+          output: generationOutput || undefined
+        }
+      });
+
+      batch.push({
+        id: randomId(),
+        type: 'trace-create',
+        timestamp: generationEnd,
+        body: {
+          id: traceId,
+          name: 'openclaw.turn',
+          sessionId: sessionKey ?? undefined,
+          userId: agentId ?? 'unknown',
+          tags: ['openclaw', agentId ?? 'unknown'],
+          input: input || undefined,
+          output: generationOutput || undefined,
+          metadata: {
+            durationMs,
+            messageCount: Array.isArray(messages) ? messages.length : 0,
+            toolCount,
+            success,
+            error: error ?? undefined
+          },
+          timestamp: startTime
+        }
+      });
+    }
 
     try {
       const res = await fetch(`${baseUrl}/api/public/ingestion`, {
         method: 'POST',
         headers: {
           Authorization: authHeader,
-          'Content-Type': 'application/json',
+          'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ batch }),
+        body: JSON.stringify({ batch })
       });
       if (!res.ok) {
         const text = await res.text().catch(() => '');
@@ -151,22 +266,53 @@ export function register(api) {
   });
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
 function extractText(content, maxLen) {
-  if (typeof content === 'string') {
-    return content.slice(0, maxLen);
-  }
+  if (typeof content === 'string') return content.slice(0, maxLen);
   if (Array.isArray(content)) {
     return content
-      .filter((c) => c?.type === 'text' && typeof c.text === 'string')
-      .map((c) => c.text)
+      .filter(part => part?.type === 'text' && typeof part.text === 'string')
+      .map(part => part.text)
       .join('\n')
       .slice(0, maxLen);
   }
   return '';
 }
 
+function extractAggregatedText(details, maxLen) {
+  if (!details || typeof details !== 'object') return '';
+  return typeof details.aggregated === 'string' ? details.aggregated.slice(0, maxLen) : '';
+}
+
+function toolCallArgs(part) {
+  if (part?.arguments && typeof part.arguments === 'object') {
+    try {
+      return JSON.stringify(part.arguments).slice(0, 12000);
+    } catch {
+      return '';
+    }
+  }
+  if (typeof part?.partialJson === 'string') return part.partialJson.slice(0, 12000);
+  return '';
+}
+
+function toIsoString(value, fallback) {
+  if (typeof value === 'string' && value) return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return new Date(value).toISOString();
+  return fallback;
+}
+
 function randomId() {
   return crypto.randomUUID();
+}
+
+function loadLocalConfig() {
+  try {
+    const home = process.env.HOME;
+    if (!home) return {};
+    const configPath = path.join(home, '.openclaw', 'openclaw.json');
+    const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    return parsed?.plugins?.entries?.['langfuse-tracer']?.config ?? {};
+  } catch {
+    return {};
+  }
 }
