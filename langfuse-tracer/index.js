@@ -55,11 +55,12 @@ export function register(api) {
     const now = new Date().toISOString();
     const startedAt = pending?.startedAt ?? (durationMs ? Date.now() - durationMs : Date.now());
     const startTime = new Date(startedAt).toISOString();
+    const currentMessages = selectCurrentTurnMessages(Array.isArray(messages) ? messages : [], pending?.prompt ?? '');
 
     let input = pending?.prompt ?? '';
     if (!input) {
-      for (let i = messages.length - 1; i >= 0; i -= 1) {
-        const msg = messages[i];
+      for (let i = currentMessages.length - 1; i >= 0; i -= 1) {
+        const msg = currentMessages[i];
         if (msg?.role === 'user') {
           input = extractText(msg.content, 4000);
           break;
@@ -88,7 +89,7 @@ export function register(api) {
         metadata: {
           success,
           error: error ?? undefined,
-          messageCount: Array.isArray(messages) ? messages.length : 0
+          messageCount: currentMessages.length
         },
         timestamp: startTime
       }
@@ -110,7 +111,7 @@ export function register(api) {
       }
     });
 
-    for (const msg of Array.isArray(messages) ? messages : []) {
+    for (const msg of currentMessages) {
       if (!msg || typeof msg !== 'object') continue;
 
       if (msg.role === 'assistant') {
@@ -199,7 +200,7 @@ export function register(api) {
           usage,
           metadata: {
             durationMs,
-            messageCount: Array.isArray(messages) ? messages.length : 0,
+            messageCount: currentMessages.length,
             sessionKey: sessionKey ?? undefined,
             provider: finalAssistant.provider ?? undefined,
             assistantMessageId: finalAssistant.id ?? undefined,
@@ -237,7 +238,7 @@ export function register(api) {
           output: generationOutput || undefined,
           metadata: {
             durationMs,
-            messageCount: Array.isArray(messages) ? messages.length : 0,
+            messageCount: currentMessages.length,
             toolCount,
             success,
             error: error ?? undefined
@@ -276,6 +277,33 @@ function extractText(content, maxLen) {
       .slice(0, maxLen);
   }
   return '';
+}
+
+function selectCurrentTurnMessages(messages, pendingPrompt) {
+  if (!Array.isArray(messages) || messages.length === 0) return [];
+
+  const normalizedPrompt = normalizePromptText(pendingPrompt);
+  if (normalizedPrompt) {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const msg = messages[i];
+      if (msg?.role !== 'user') continue;
+      const candidate = normalizePromptText(extractText(msg.content, 12000));
+      if (!candidate) continue;
+      if (candidate === normalizedPrompt || candidate.endsWith(normalizedPrompt) || normalizedPrompt.endsWith(candidate)) {
+        return messages.slice(i);
+      }
+    }
+  }
+
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]?.role === 'user') return messages.slice(i);
+  }
+
+  return messages;
+}
+
+function normalizePromptText(value) {
+  return typeof value === 'string' ? value.trim().replace(/\r\n/g, '\n') : '';
 }
 
 function extractAggregatedText(details, maxLen) {
